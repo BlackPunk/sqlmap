@@ -125,6 +125,7 @@ from lib.core.settings import HTTP_CHUNKED_SPLIT_KEYWORDS
 from lib.core.settings import IGNORE_SAVE_OPTIONS
 from lib.core.settings import INFERENCE_UNKNOWN_CHAR
 from lib.core.settings import INVALID_UNICODE_CHAR_FORMAT
+from lib.core.settings import INVALID_UNICODE_PRIVATE_AREA
 from lib.core.settings import IP_ADDRESS_REGEX
 from lib.core.settings import ISSUES_PAGE
 from lib.core.settings import IS_WIN
@@ -153,6 +154,7 @@ from lib.core.settings import REFLECTED_REPLACEMENT_REGEX
 from lib.core.settings import REFLECTED_REPLACEMENT_TIMEOUT
 from lib.core.settings import REFLECTED_VALUE_MARKER
 from lib.core.settings import REFLECTIVE_MISS_THRESHOLD
+from lib.core.settings import SAFE_HEX_MARKER
 from lib.core.settings import SENSITIVE_DATA_REGEX
 from lib.core.settings import SENSITIVE_OPTIONS
 from lib.core.settings import STDIN_PIPE_DASH
@@ -603,7 +605,20 @@ def paramToDict(place, parameters=None):
             condition |= place == PLACE.COOKIE and len(intersect((PLACE.COOKIE,), conf.testParameter, True)) > 0
 
             if condition:
-                testableParameters[parameter] = "=".join(parts[1:])
+                value = "=".join(parts[1:])
+
+                if parameter in (conf.base64Parameter or []):
+                    try:
+                        oldValue = value
+                        value = value.decode("base64")
+                        parameters = re.sub(r"\b%s\b" % re.escape(oldValue), value, parameters)
+                    except:
+                        errMsg = "parameter '%s' does not contain " % parameter
+                        errMsg += "valid Base64 encoded value ('%s')" % value
+                        raise SqlmapValueException(errMsg)
+
+                testableParameters[parameter] = value
+
                 if not conf.multipleTargets and not (conf.csrfToken and re.search(conf.csrfToken, parameter, re.I)):
                     _ = urldecode(testableParameters[parameter], convall=True)
                     if (_.endswith("'") and _.count("'") == 1 or re.search(r'\A9{3,}', _) or re.search(r'\A-\d+\Z', _) or re.search(DUMMY_USER_INJECTION, _)) and not parameter.upper().startswith(GOOGLE_ANALYTICS_COOKIE_PREFIX):
@@ -2404,14 +2419,10 @@ def getUnicode(value, encoding=None, noneToNull=False):
             except UnicodeDecodeError:
                 pass
 
-        while True:
-            try:
-                return six.text_type(value, encoding or (kb.get("pageEncoding") if kb.get("originalPage") else None) or UNICODE_ENCODING)
-            except UnicodeDecodeError as ex:
-                try:
-                    return six.text_type(value, UNICODE_ENCODING)
-                except:
-                    value = value[:ex.start] + "".join(INVALID_UNICODE_CHAR_FORMAT % ord(_) for _ in value[ex.start:ex.end]) + value[ex.end:]
+        try:
+            return six.text_type(value, encoding or (kb.get("pageEncoding") if kb.get("originalPage") else None) or UNICODE_ENCODING)
+        except UnicodeDecodeError as ex:
+            return six.text_type(value, UNICODE_ENCODING, errors="reversible")
     elif isListLike(value):
         value = list(getUnicode(_, encoding, noneToNull) for _ in value)
         return value
@@ -2420,6 +2431,30 @@ def getUnicode(value, encoding=None, noneToNull=False):
             return six.text_type(value)
         except UnicodeDecodeError:
             return six.text_type(str(value), errors="ignore")  # encoding ignored for non-basestring instances
+
+def getASCII(value):
+    """
+    Returns ASCII representation of provided Unicode value
+
+    >>> getASCII(getUnicode("foo\x01\x83\xffbar")) == "foo\x01\x83\xffbar"
+    True
+    """
+
+    retVal = value
+
+    if isinstance(value, six.text_type):
+        if INVALID_UNICODE_PRIVATE_AREA:
+            for char in xrange(0xF0000, 0xF00FF + 1):
+                value = value.replace(unichr(char), "%s%02x" % (SAFE_HEX_MARKER, char - 0xF0000))
+
+            retVal = value.encode(UNICODE_ENCODING)
+
+            retVal = re.sub(r"%s([0-9a-f]{2})" % SAFE_HEX_MARKER, lambda _: _.group(1).decode("hex"), retVal)
+        else:
+            retVal = value.encode(UNICODE_ENCODING)
+            retVal = re.sub(r"\\x([0-9a-f]{2})", lambda _: _.group(1).decode("hex"), retVal)
+
+    return retVal
 
 def longestCommonPrefix(*sequences):
     """
@@ -3326,7 +3361,7 @@ def showHttpErrorCodes():
             msg += "could mean that some kind of protection is involved (e.g. WAF)"
             logger.debug(msg)
 
-def openFile(filename, mode='r', encoding=UNICODE_ENCODING, errors="replace", buffering=1):  # "buffering=1" means line buffered (Reference: http://stackoverflow.com/a/3168436)
+def openFile(filename, mode='r', encoding=UNICODE_ENCODING, errors="reversible", buffering=1):  # "buffering=1" means line buffered (Reference: http://stackoverflow.com/a/3168436)
     """
     Returns file handle of a given filename
     """
@@ -3417,6 +3452,16 @@ def checkIntegrity():
                     retVal = False
 
     return retVal
+
+def getDaysFromLastUpdate():
+    """
+    Get total number of days from last update
+    """
+
+    if not paths:
+        return
+
+    return int(time.time() - os.path.getmtime(paths.SQLMAP_SETTINGS_PATH)) // (3600 * 24)
 
 def unhandledExceptionMessage():
     """
@@ -3622,21 +3667,23 @@ def decodeStringEscape(value):
     retVal = value
 
     if value and '\\' in value:
-        if isinstance(value, unicode):
-            retVal = retVal.encode(UNICODE_ENCODING)
+        charset = "\\%s" % string.whitespace.replace(" ", "")
+        for _ in charset:
+            retVal = retVal.replace(repr(_).strip("'"), _)
 
-        try:
-            retVal = codecs.escape_decode(retVal)[0]
-        except:
-            try:
-                retVal = retVal.decode("string_escape")
-            except:
-                charset = string.whitespace.replace(" ", "")
-                for _ in charset:
-                    retVal = retVal.replace(repr(_).strip("'"), _)
+    return retVal
 
-        if isinstance(value, unicode):
-            retVal = getUnicode(retVal)
+def encodeStringEscape(value):
+    """
+    Encodes escaped string values (e.g. "\t" -> "\\t")
+    """
+
+    retVal = value
+
+    if value:
+        charset = "\\%s" % string.whitespace.replace(" ", "")
+        for _ in charset:
+            retVal = retVal.replace(_, repr(_).strip("'"))
 
     return retVal
 
@@ -3656,7 +3703,7 @@ def removeReflectiveValues(content, payload, suppressWarning=False):
                 return value
 
             payload = getUnicode(urldecode(payload.replace(PAYLOAD_DELIMITER, ""), convall=True))
-            regex = _(filterStringValue(payload, r"[A-Za-z0-9]", REFLECTED_REPLACEMENT_REGEX.encode("string_escape")))
+            regex = _(filterStringValue(payload, r"[A-Za-z0-9]", encodeStringEscape(REFLECTED_REPLACEMENT_REGEX)))
 
             if regex != payload:
                 if all(part.lower() in content.lower() for part in filterNone(regex.split(REFLECTED_REPLACEMENT_REGEX))[1:]):  # fast optimization check
